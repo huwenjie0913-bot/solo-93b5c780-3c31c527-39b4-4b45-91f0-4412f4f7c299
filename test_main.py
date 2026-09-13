@@ -119,6 +119,120 @@ def test_locked_pair_conflict_identifies_both_devices(client):
     assert detail["required_separation_hz"] > detail["separation_hz"]
 
 
+def test_cross_band_second_harmonic_avoids_future_victim_conflict(client):
+    rule_response = client.post(
+        "/api/rules",
+        json={
+            "name": "cross-band-im-regression",
+            "guard_spacing_mhz": 0.001,
+            "adjacent_isolation_db": 0,
+            "coupling_loss_db": 0,
+            "im2_rejection_db": 0,
+            "im3_rejection_db": 0,
+            "victim_threshold_dbm": -200,
+        },
+    )
+    assert rule_response.status_code == 201, rule_response.text
+    rule_id = rule_response.json()["id"]
+
+    def cross_band_devices(a_locked=None, c_locked=None):
+        return [
+            device(
+                "UHF TX",
+                band_min_mhz=530.2,
+                band_max_mhz=530.8,
+                step_mhz=0.6,
+                bandwidth_mhz=0.01,
+                tx_power_dbm=20,
+                locked_mhz=a_locked,
+            ),
+            device(
+                "VHF TX",
+                band_min_mhz=100.2,
+                band_max_mhz=100.3,
+                step_mhz=0.1,
+                bandwidth_mhz=0.01,
+                tx_power_dbm=20,
+                locked_mhz=100.2,
+            ),
+            device(
+                "future victim",
+                band_min_mhz=200.3,
+                band_max_mhz=200.4,
+                step_mhz=0.1,
+                bandwidth_mhz=0.01,
+                tx_power_dbm=20,
+                locked_mhz=c_locked,
+            ),
+        ]
+
+    # Small exhaustive reference: only UHF and the future victim have choices.
+    exhaustive = {}
+    for a_frequency, c_frequency in [
+        (530.2, 200.3),
+        (530.2, 200.4),
+        (530.8, 200.3),
+        (530.8, 200.4),
+    ]:
+        locked_response = client.post(
+            "/api/coordination/plans",
+            json={
+                "name": f"exhaustive {a_frequency} {c_frequency}",
+                "rule_id": rule_id,
+                "devices": cross_band_devices(a_frequency, c_frequency),
+                "max_search_nodes": 100,
+            },
+        )
+        assert locked_response.status_code == 201, locked_response.text
+        plan = locked_response.json()
+        exhaustive[(a_frequency, c_frequency)] = plan["scheme"]["total_conflict_count"]
+
+    assert exhaustive == {
+        (530.2, 200.3): 0,
+        (530.2, 200.4): 1,
+        (530.8, 200.3): 0,
+        (530.8, 200.4): 1,
+    }
+
+    bad_locked = client.post(
+        "/api/coordination/plans",
+        json={
+            "name": "known bad harmonic assignment",
+            "rule_id": rule_id,
+            "devices": cross_band_devices(530.8, 200.4),
+            "max_search_nodes": 100,
+        },
+    )
+    assert bad_locked.status_code == 201
+    victim_report = bad_locked.json()["device_reports"][2]
+    assert [
+        threat
+        for threat in victim_report["intermodulation_threats"]
+        if threat["is_conflict"]
+        and threat["kind"] == "IM2:2f"
+        and threat["frequency_mhz"] == 200.4
+        and threat["source_device_indices"] == [1]
+    ]
+
+    optimized = client.post(
+        "/api/coordination/plans",
+        json={
+            "name": "cross-band optimized",
+            "rule_id": rule_id,
+            "devices": cross_band_devices(),
+            "max_search_nodes": 100,
+        },
+    )
+    assert optimized.status_code == 201, optimized.text
+    result = optimized.json()
+    assert result["scheme"]["total_conflict_count"] == min(exhaustive.values())
+    assert result["scheme"]["weighted_conflict_count"] == 0
+    assert [a["frequency_mhz"] for a in result["assignments"]] == [530.2, 100.2, 200.3]
+    assert all(
+        report["conflict_count"] == 0 for report in result["device_reports"]
+    )
+
+
 def test_invalid_step_validation(client):
     payload = {
         "name": "invalid step",

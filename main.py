@@ -719,7 +719,6 @@ def evaluate_add(
     rules: Dict[str, Any],
     virtual_sources: Optional[List[Dict[str, Any]]] = None,
     existing_products: Optional[List[Dict[str, Any]]] = None,
-    new_product_bands: Optional[List[Tuple[int, int]]] = None,
 ) -> Dict[str, Any]:
     """Return conflicts and local minimum margins introduced by this assignment."""
     virtual_sources = virtual_sources or []
@@ -781,7 +780,11 @@ def evaluate_add(
     new_source_sets: List[Tuple[int, ...]] = [(idx,)]
     new_source_sets.extend((idx, j) for j in source_indices)
     new_source_sets.extend((idx, a, b) for a, b in itertools.combinations(source_indices, 2))
-    effective_victim_bands = new_product_bands or victim_bands
+    # Generate every product which can reach any still-unassigned victim band.
+    # The new product is only scored against currently assigned victims here;
+    # it remains in the DFS product cache and is scored when that future victim
+    # is assigned, making incremental totals identical to the full report.
+    effective_victim_bands = [(d["band_min"], d["band_max"]) for d in devices]
     new_products = im_products_for_source_sets(
         list(selected.values()), new_source_sets, rules, effective_victim_bands
     )
@@ -837,7 +840,6 @@ def solve(
 ) -> Dict[int, int]:
     # Locks are represented as one-value domains.  The search variable ordering
     # then assigns them first without special-casing their margins or products.
-    assigned: Dict[int, int] = {}
     search_domains = [
         [d["locked"]] if d["locked"] is not None else list(domains[i])
         for i, d in enumerate(devices)
@@ -846,7 +848,6 @@ def solve(
 
     failure = {"detail": None}
     nodes = 0
-    best_conflict_key = math.inf
 
     def record_failure(idx: int, current: Dict[int, int]) -> None:
         blockers: List[Dict[str, Any]] = []
@@ -894,8 +895,6 @@ def solve(
         return (
             ev["weighted_conflicts"],
             ev["conflicts"],
-            -ev["min_level_margin_db"],
-            -ev["min_frequency_margin_hz"],
             f,
         )
 
@@ -906,9 +905,13 @@ def solve(
         min_f: int,
         min_l: float,
         products: List[Dict[str, Any]],
-        best_obj: Tuple[float, int, int, float],
-    ) -> Optional[Tuple[Dict[int, int], Tuple[float, int, int, float]]]:
-        nonlocal nodes, best_conflict_key
+        best_key: Tuple[float, int, Tuple[int, ...], Tuple[int, ...]],
+        var_path: Tuple[int, ...] = (),
+        frequency_path: Tuple[int, ...] = (),
+    ) -> Optional[
+        Tuple[Dict[int, int], Tuple[float, int, Tuple[int, ...], Tuple[int, ...]]]
+    ]:
+        nonlocal nodes
         nodes += 1
         if nodes > max_nodes:
             raise APIError(
@@ -918,14 +921,13 @@ def solve(
             )
 
         if len(current) == len(devices):
-            return dict(current), (weighted, raw, -min_f, -min_l)
-
-        if weighted >= best_conflict_key:
-            return None
+            ordered_frequencies = tuple(current[i] for i in var_path)
+            return dict(current), (weighted, raw, var_path, ordered_frequencies)
 
         var = select_variable(current)
         if var is None:
             return None
+        next_var_path = var_path + (var,)
 
         candidates = [f for f in search_domains[var] if compatible(f, devices[var], current, devices, rules)]
         scored = []
@@ -946,25 +948,26 @@ def solve(
                 (
                     ev["weighted_conflicts"],
                     ev["conflicts"],
-                    -ev["min_level_margin_db"],
-                    -ev["min_frequency_margin_hz"],
                     f,
                 )
             )
         scored.sort()
 
         best = None
-        for _, _, _, _, f in scored:
+        for _, _, f in scored:
             ev = evaluations[f]
             new_weighted = weighted + ev["weighted_conflicts"]
             new_raw = raw + ev["conflicts"]
             new_min_f = min(min_f, ev["min_frequency_margin_hz"])
             new_min_l = min(min_l, ev["min_level_margin_db"])
-            tentative_obj = (new_weighted, new_raw, -new_min_f, -new_min_l)
-            if new_weighted >= best_conflict_key:
+            tentative_key = (new_weighted, new_raw)
+            if tentative_key > best_key[:2]:
                 continue
-            if tentative_obj >= best_obj:
-                continue
+
+            next_frequency_path = frequency_path + (f,)
+            if tentative_key == best_key[:2] and best_key[2][: len(next_var_path)] == next_var_path:
+                if next_frequency_path >= best_key[3][: len(next_frequency_path)]:
+                    continue
 
             current[var] = f
             outcome = dfs(
@@ -974,14 +977,15 @@ def solve(
                 new_min_f,
                 new_min_l,
                 products + ev["new_products"],
-                best_obj,
+                best_key,
+                next_var_path,
+                next_frequency_path,
             )
             del current[var]
             if outcome is not None and (best is None or outcome[1] < best[1]):
                 best = outcome
-                best_obj = outcome[1]
-                best_conflict_key = outcome[1][0]
-                if best_conflict_key == 0:
+                best_key = outcome[1]
+                if best_key[:2] == (0, 0):
                     return best
         return best
 
@@ -996,6 +1000,7 @@ def solve(
 
     # Greedy first solution gives branch-and-bound an early upper bound.
     greedy: Dict[int, int] = {}
+    greedy_order: List[int] = []
     greedy_products = list(initial_products)
     greedy_state = (0.0, 0, math.inf, math.inf)
     greedy_ok = True
@@ -1017,6 +1022,7 @@ def solve(
             greedy_products,
         )
         greedy[var] = f
+        greedy_order.append(var)
         greedy_products.extend(ev["new_products"])
         greedy_state = (
             greedy_state[0] + ev["weighted_conflicts"],
@@ -1025,23 +1031,27 @@ def solve(
             min(greedy_state[3], ev["min_level_margin_db"]),
         )
 
-    best_obj = (math.inf, math.inf, math.inf, math.inf)
+    best_key: Tuple[float, int, Tuple[int, ...], Tuple[int, ...]] = (
+        math.inf,
+        math.inf,
+        tuple(),
+        tuple(),
+    )
     if greedy_ok:
-        best_conflict_key = greedy_state[0]
-        best_obj = (
+        best_key = (
             greedy_state[0],
             greedy_state[1],
-            -greedy_state[2],
-            -greedy_state[3],
+            tuple(greedy_order),
+            tuple(greedy[i] for i in greedy_order),
         )
 
-    result = dfs({}, 0.0, 0, math.inf, math.inf, initial_products, best_obj)
+    result = dfs({}, 0.0, 0, math.inf, math.inf, initial_products, best_key)
     if result is not None:
         return result[0]
 
     if greedy_ok:
-        # DFS only accepts a strictly better tie-break than the greedy upper
-        # bound, so an equal valid greedy solution is deliberately returned here.
+        # DFS only returns assignments that strictly beat the greedy upper
+        # bound, so when search is exhausted without one, greedy is optimal.
         return greedy
 
     detail = failure["detail"] or {
@@ -1184,7 +1194,6 @@ def build_report(
                 rules,
                 virtual_sources,
                 products_without_device[idx],
-                [(devices[idx]["band_min"], devices[idx]["band_max"])],
             )
             alternatives.append(
                 (
